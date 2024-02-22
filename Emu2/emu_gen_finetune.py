@@ -9,9 +9,10 @@ from torchvision import transforms as TF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights, infer_auto_device_map, load_checkpoint_and_dispatch
 from diffusers import DiffusionPipeline
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate import FullyShardedDataParallelPlugin
 import PIL
+from datetime import datetime, timedelta
 from transformers import BitsAndBytesConfig
 from torchvision import transforms
 import math
@@ -226,11 +227,15 @@ def accelerator_parameters(model, train_dataloader, val_dataloader):
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
+    # Avoid val timeout error
+    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=96000))
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         # mixed_precision=args.mixed_precision,
         log_with=args.report_to,
-        project_config=accelerator_project_config,)
+        project_config=accelerator_project_config,
+        kwargs_handlers=[kwargs])
     
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
     
@@ -398,9 +403,10 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
                                 # prompt_embeds = val_model.generate_images([text_prompt], tokenizer, image_prompt)
                                 edited_image = pipeline.validation_forward(prompt_embeds=prompt_embeds).image
 
-                                h_concat = PIL.Image.new('RGB', (edited_image.width * 2, edited_image.height))
+                                h_concat = PIL.Image.new('RGB', (edited_image.width * 3, edited_image.height))
                                 h_concat.paste(edited_image, (0, 0))
-                                h_concat.paste(batch['image'][bn].resize((args.resolution, args.resolution)), (edited_image.width, 0))
+                                h_concat.paste(batch['original_image'][bn].resize((args.resolution, args.resolution)), (edited_image.width, 0))
+                                h_concat.paste(batch['image'][bn].resize((args.resolution, args.resolution)), (edited_image.width*2, 0))
                                 edited_images.append(h_concat)
                                 texts.append(batch['text'][bn])
                             break
@@ -444,9 +450,10 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
                                 # prompt_embeds = val_model.generate_images([text_prompt], tokenizer, image_prompt)
                                 edited_image = pipeline.validation_forward(prompt_embeds=prompt_embeds).image
 
-                                h_concat = PIL.Image.new('RGB', (edited_image.width * 2, edited_image.height))
+                                h_concat = PIL.Image.new('RGB', (edited_image.width * 3, edited_image.height))
                                 h_concat.paste(edited_image, (0, 0))
-                                h_concat.paste(batch['image'][bn].resize((args.resolution, args.resolution)), (edited_image.width, 0))
+                                h_concat.paste(batch['original_image'][bn].resize((args.resolution, args.resolution)), (edited_image.width, 0))
+                                h_concat.paste(batch['image'][bn].resize((args.resolution, args.resolution)), (edited_image.width * 2, 0))
                                 edited_images.append(h_concat)
                                 texts.append(batch['text'][bn])
                             break
