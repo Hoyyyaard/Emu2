@@ -90,7 +90,11 @@ class Diffusion_Finetune_Dataset(Dataset):
                 'text':text,
                 'exo_pixel_values':exo_pixel_values,
                 'original_pixel_values': exo_pixel_values,  
-                'interleave_sequence': exo_images + [text] + [image]}
+                'interleave_sequence': exo_images + [text] + [image],
+                'interleave_sequence_val': exo_images + [text] ,
+                }
+
+    
                 
         
     def __len__(self):

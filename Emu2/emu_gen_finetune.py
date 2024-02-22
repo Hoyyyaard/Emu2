@@ -26,6 +26,9 @@ from diffusers.optimization import get_scheduler
 import argparse 
 import os
 from dataset import Diffusion_Finetune_Dataset
+from peft import LoraConfig, get_peft_model
+from peft.utils import get_peft_model_state_dict
+
 
 # Argparse here
 def parse_args():
@@ -60,6 +63,7 @@ def parse_args():
     parser.add_argument("--validation_epochs", type=int, default=5, help="Validation epochs")
     parser.add_argument("--val", action="store_true", help="Run validation")
     parser.add_argument("--use_quant_model", action="store_true", help="4 bit quant to load the model")
+    parser.add_argument("--lora", action="store_true", help="")
 
     return parser.parse_args()
 
@@ -96,7 +100,8 @@ def build_dataloader(args, tokenizer):
         image = [example['image'] for example in examples]
         origin_image = [example['original_image'] for example in examples]
         interleave_sequence = [example['interleave_sequence'] for example in examples]
-        return {"edited_pixel_values": pixel_values, "input_ids": input_ids, 'image':image, 'original_image':origin_image, 'text':text, 'exo_pixel_values':exo_pixel_values, 'original_pixel_values':original_pixel_values, 'interleave_sequence':interleave_sequence}
+        interleave_sequence_val = [example['interleave_sequence_val'] for example in examples]
+        return {"edited_pixel_values": pixel_values, "input_ids": input_ids, 'image':image, 'original_image':origin_image, 'text':text, 'exo_pixel_values':exo_pixel_values, 'original_pixel_values':original_pixel_values, 'interleave_sequence':interleave_sequence, 'interleave_sequence_val':interleave_sequence_val}
     
     def preprocess_func(image, text):
         return train_transforms(image), tokenize_captions(text)
@@ -153,6 +158,19 @@ def build_model(args):
             device_map={'':Accelerator().process_index}
             )  
     
+    if args.lora:
+        # lora config
+        print("--------Apply Lora----------------")
+        lora_config = LoraConfig(
+            r = 16, # the dimension of the low-rank matrices
+            lora_alpha = 8, # scaling factor for LoRA activations vs pre-trained weight activations
+            target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+            lora_dropout = 0.05, # dropout probability of the LoRA layers
+            bias = 'none', # wether to train bias weights, set to 'none' for attention layers
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
     return model, tokenizer
 
 # Optimizer parameters here
@@ -358,7 +376,7 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
                         for batch in (train_dataloader):
                             for bn in tqdm(range(len(batch['text'][:10])), desc="Generating train images"):
                                 text_prompt, image_prompt = "", []
-                                for x in batch['interleave_sequence'][bn]:
+                                for x in batch['interleave_sequence_val'][bn]:
                                     if isinstance(x, str):
                                         text_prompt += x
                                     else:
@@ -404,7 +422,7 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
                             for bn in tqdm(range(len(batch['text'][:10])), desc="Generating val images"):
 
                                 text_prompt, image_prompt = "", []
-                                for x in batch['interleave_sequence'][bn]:
+                                for x in batch['interleave_sequence_val'][bn]:
                                     if isinstance(x, str):
                                         text_prompt += x
                                     else:
