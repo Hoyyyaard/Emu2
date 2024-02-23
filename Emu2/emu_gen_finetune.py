@@ -2,6 +2,7 @@
 from PIL import Image 
 import requests
 import torch 
+import torch.distributed as dist
 from emu.constants import *
 import logging
 import shutil
@@ -159,6 +160,12 @@ def build_model(args):
             device_map={'':Accelerator().process_index}
             )  
     
+    model.model.visual.eval()
+    model.model.decoder.train()
+    model.project_down.train()
+    model.project_up.train()
+    model.model.visual.requires_grad_(False)
+
     if args.lora:
         # lora config
         print("--------Apply Lora----------------")
@@ -176,11 +183,6 @@ def build_model(args):
 
 # Optimizer parameters here
 def accelerator_parameters(model, train_dataloader, val_dataloader):
-    model.model.visual.eval()
-    model.model.decoder.train()
-    model.project_down.train()
-    model.project_up.train()
-    model.model.visual.requires_grad_(False)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -228,8 +230,8 @@ def accelerator_parameters(model, train_dataloader, val_dataloader):
     )
 
     # Avoid val timeout error
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=96000))
-
+    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=9600000))
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         # mixed_precision=args.mixed_precision,
@@ -350,6 +352,34 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
+        if epoch % args.checkpointing_steps == 0 and epoch > 0:
+            if accelerator.is_main_process:
+                # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                if args.checkpoints_total_limit is not None:
+                    checkpoints = os.listdir(args.output_dir)
+                    checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                    # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                    if len(checkpoints) >= args.checkpoints_total_limit:
+                        num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                        removing_checkpoints = checkpoints[0:num_to_remove]
+
+                        logger.info(
+                            f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                        )
+                        logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                        for removing_checkpoint in removing_checkpoints:
+                            removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                            shutil.rmtree(removing_checkpoint)
+
+                save_path = os.path.join(
+                    args.output_dir, f"checkpoint-{global_step}-{epoch}"
+                )
+                accelerator.save_state(save_path)
+                logger.info(f"Saved state to {save_path}")
+
 
         if accelerator.is_main_process:
             if (
@@ -405,7 +435,11 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
 
                                 h_concat = PIL.Image.new('RGB', (edited_image.width * 3, edited_image.height))
                                 h_concat.paste(edited_image, (0, 0))
-                                h_concat.paste(batch['original_image'][bn].resize((args.resolution, args.resolution)), (edited_image.width, 0))
+                                original_images = [oi.resize((int(args.resolution/2), int(args.resolution/2))) for oi in batch['original_image'][bn]]
+                                h_concat.paste(original_images[0], (edited_image.width, 0))
+                                h_concat.paste(original_images[1], (edited_image.width, int(edited_image.height/2)))
+                                h_concat.paste(original_images[2], (int(edited_image.width*3/2), int(edited_image.height/2)))
+                                h_concat.paste(original_images[3], (int(edited_image.width*3/2), 0))
                                 h_concat.paste(batch['image'][bn].resize((args.resolution, args.resolution)), (edited_image.width*2, 0))
                                 edited_images.append(h_concat)
                                 texts.append(batch['text'][bn])
@@ -452,7 +486,11 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
 
                                 h_concat = PIL.Image.new('RGB', (edited_image.width * 3, edited_image.height))
                                 h_concat.paste(edited_image, (0, 0))
-                                h_concat.paste(batch['original_image'][bn].resize((args.resolution, args.resolution)), (edited_image.width, 0))
+                                original_images = [oi.resize((int(args.resolution/2), int(args.resolution/2))) for oi in batch['original_image'][bn]]
+                                h_concat.paste(original_images[0], (edited_image.width, 0))
+                                h_concat.paste(original_images[1], (edited_image.width, int(edited_image.height/2)))
+                                h_concat.paste(original_images[2], (int(edited_image.width*3/2), int(edited_image.height/2)))
+                                h_concat.paste(original_images[3], (int(edited_image.width*3/2), 0))
                                 h_concat.paste(batch['image'][bn].resize((args.resolution, args.resolution)), (edited_image.width * 2, 0))
                                 edited_images.append(h_concat)
                                 texts.append(batch['text'][bn])
@@ -532,35 +570,6 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
                 if global_step >= args.max_train_steps:
                     break
 
-        if epoch % args.checkpointing_steps == 0:
-            if accelerator.is_main_process:
-                # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                if args.checkpoints_total_limit is not None:
-                    checkpoints = os.listdir(args.output_dir)
-                    checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                    # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                    if len(checkpoints) >= args.checkpoints_total_limit:
-                        num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                        removing_checkpoints = checkpoints[0:num_to_remove]
-
-                        logger.info(
-                            f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                        )
-                        logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                        for removing_checkpoint in removing_checkpoints:
-                            removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                            shutil.rmtree(removing_checkpoint)
-
-                save_path = os.path.join(
-                    args.output_dir, f"checkpoint-{global_step}-{epoch}"
-                )
-                accelerator.save_state(save_path)
-                logger.info(f"Saved state to {save_path}")
-
-
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -581,6 +590,7 @@ def train_model(accelerator, model, optimizer, train_dataloader, val_dataloader,
 
 # Main function here
 if __name__ == "__main__":
+    dist.init_process_group(backend='nccl', init_method='env://', timeout=timedelta(seconds=5400))
     args = parse_args()
     model, tokenizer = build_model(args)
     train_dataloader, val_dataloader = build_dataloader(args, tokenizer)
